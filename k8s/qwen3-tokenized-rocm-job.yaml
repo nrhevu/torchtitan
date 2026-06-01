@@ -1,0 +1,186 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-tokenized-rocm
+  namespace: vunguyen13
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: qwen3-tokenized-rocm
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - vu
+      containers:
+        - name: trainer
+          image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/torchtitan
+          securityContext:
+            privileged: true
+          env:
+            - name: NGPU
+              value: "1"
+            - name: LOG_RANK
+              value: "0"
+            - name: PYTORCH_ALLOC_CONF
+              value: expandable_segments:True
+            - name: TORCHTITAN_CONFIG_PATH
+              value: /tmp/torchtitan_config/custom.toml
+            - name: HF_REPO_ID
+              value: Qwen/Qwen3-0.6B
+            - name: HF_ASSET_TYPES
+              value: tokenizer
+            - name: HF_ADDITIONAL_PATTERNS
+              value: ""
+            - name: HF_DOWNLOAD_ALL
+              value: "0"
+            - name: HF_ASSETS_DIR
+              value: ./assets/hf
+            - name: SKIP_HF_DOWNLOAD
+              value: "0"
+            - name: MODEL_NAME
+              value: qwen3
+            - name: MODEL_FLAVOR
+              value: 0.6B
+            - name: MODEL_HF_ASSETS_PATH
+              value: ./assets/hf/Qwen3-0.6B
+            - name: TORCHTITAN_TOML
+              value: |
+                [job]
+                dump_folder = "./outputs/qwen3_tokenized"
+                description = "Qwen 3 0.6B tokenized dataset training"
+
+                [profiling]
+                enable_profiling = false
+                save_traces_folder = "profile_trace"
+                profile_freq = 100
+
+                [metrics]
+                log_freq = 1
+                enable_tensorboard = false
+                save_tb_folder = "tb"
+
+                [model]
+                name = "qwen3"
+                flavor = "0.6B"
+                hf_assets_path = "./assets/hf/Qwen3-0.6B"
+                # converters = ["float8"]
+
+                [optimizer]
+                name = "AdamW"
+                lr = 3e-4
+                eps = 1e-8
+
+                [lr_scheduler]
+                warmup_steps = 1  # lr scheduler warm up
+
+                [training]
+                local_batch_size = 1
+                seq_len = 128
+                max_norm = 1.0  # grad norm clipping
+                steps = 100
+                dataset = "tokenized_disk"
+                dataset_path = "./tokenized_data"
+
+                [parallelism]
+                data_parallel_replicate_degree = 1
+                data_parallel_shard_degree = -1
+                fsdp_reshard_after_forward = "default" # default / never / always
+                tensor_parallel_degree = 1
+                context_parallel_degree = 1
+
+                [checkpoint]
+                enable = false
+                folder = "checkpoint"
+                interval = 500
+                last_save_model_only = false
+                export_dtype = "float16"
+                async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+
+                [activation_checkpoint]
+                mode = "selective"  # ["none", "selective", "full"]
+                selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
+
+                [compile]
+                enable=false
+                components = ["model", "loss"]
+
+                [quantize.linear.float8]
+                enable_fsdp_float8_all_gather = false
+                precompute_float8_dynamic_scale_for_fsdp = false
+                filter_fqns = ["output"]
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              mkdir -p "$(dirname "${TORCHTITAN_CONFIG_PATH}")"
+              printf "%s" "${TORCHTITAN_TOML}" > "${TORCHTITAN_CONFIG_PATH}"
+
+              if [[ "${SKIP_HF_DOWNLOAD}" != "1" ]]; then
+                download_cmd=(python scripts/download_hf_assets.py --repo_id "${HF_REPO_ID}" --local_dir "${HF_ASSETS_DIR}")
+
+                if [[ "${HF_DOWNLOAD_ALL}" == "1" ]]; then
+                  download_cmd+=(--all)
+                else
+                  read -r -a asset_types <<< "${HF_ASSET_TYPES}"
+                  if ((${#asset_types[@]})); then
+                    download_cmd+=(--assets "${asset_types[@]}")
+                  fi
+
+                  read -r -a additional_patterns <<< "${HF_ADDITIONAL_PATTERNS}"
+                  if ((${#additional_patterns[@]})); then
+                    download_cmd+=(--additional_patterns "${additional_patterns[@]}")
+                  fi
+                fi
+
+                if [[ -n "${HF_TOKEN:-}" ]]; then
+                  download_cmd+=(--hf_token "${HF_TOKEN}")
+                fi
+
+                "${download_cmd[@]}"
+              fi
+
+              torchrun \
+                --nproc_per_node="${NGPU}" \
+                --rdzv_backend c10d \
+                --rdzv_endpoint=localhost:0 \
+                --local-ranks-filter "${LOG_RANK}" \
+                --role rank \
+                --tee 3 \
+                -m torchtitan.train \
+                --job.config_file "${TORCHTITAN_CONFIG_PATH}" \
+                --model.name "${MODEL_NAME}" \
+                --model.flavor "${MODEL_FLAVOR}" \
+                --model.hf_assets_path "${MODEL_HF_ASSETS_PATH}"
+          volumeMounts:
+            - name: hf-assets
+              mountPath: /workspace/torchtitan/assets/hf
+            - name: data
+              mountPath: /workspace/torchtitan/tokenized_data
+              readOnly: true
+            - name: output
+              mountPath: /workspace/torchtitan/outputs
+      volumes:
+        - name: hf-assets
+          hostPath:
+            path: /scratch/nfs_server/vunguyen13/ServicePackage/torchtitan/assets/hf
+            type: DirectoryOrCreate
+        - name: data
+          hostPath:
+            path: /scratch/nfs_server/vunguyen13/ServicePackage/tokenized_data
+            type: Directory
+        - name: output
+          hostPath:
+            path: /scratch/nfs_server/vunguyen13/ServicePackage/torchtitan/outputs
+            type: DirectoryOrCreate

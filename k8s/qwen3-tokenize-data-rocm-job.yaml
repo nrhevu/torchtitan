@@ -1,0 +1,111 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-tokenize-data-rocm
+  namespace: vunguyen13
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: qwen3-tokenize-data-rocm
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - vu
+      containers:
+        - name: tokenizer
+          image: torchtitan:rocm7.2.4
+          imagePullPolicy: Never
+          workingDir: /workspace
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: /tmp/huggingface
+            - name: HF_DATASETS_CACHE
+              value: /tmp/huggingface/datasets
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: DATASET_PATH
+              value: /data/fineweb-edu
+            - name: DATASET_DATA_DIR
+              value: sample/10BT
+            - name: DATASET_SPLIT
+              value: train
+            - name: TOKENIZER_NAME
+              value: Qwen/Qwen3-4B
+            - name: OUTPUT_PATH
+              value: /output/tokenized_data
+            - name: NUM_PROC
+              value: "128"
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              python - <<'PY'
+              import os
+              from pathlib import Path
+
+              from datasets import load_dataset
+              from transformers import AutoTokenizer
+
+              dataset_path = os.environ["DATASET_PATH"]
+              dataset_data_dir = os.environ["DATASET_DATA_DIR"]
+              dataset_split = os.environ["DATASET_SPLIT"]
+              tokenizer_name = os.environ["TOKENIZER_NAME"]
+              output_path = Path(os.environ["OUTPUT_PATH"])
+              num_proc = int(os.environ["NUM_PROC"])
+
+              if output_path.exists() and any(output_path.iterdir()):
+                  raise FileExistsError(
+                      f"{output_path} already exists and is not empty. "
+                      "Move or remove it before rerunning."
+                  )
+
+              output_path.mkdir(parents=True, exist_ok=True)
+
+              dataset = load_dataset(
+                  dataset_path,
+                  data_dir=dataset_data_dir,
+                  split=dataset_split,
+              )
+
+              tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+
+              def tokenize_function(examples):
+                  encodings = tokenizer.backend_tokenizer.encode_batch_fast(examples["text"])
+                  return {
+                      "input_ids": [encoding.ids for encoding in encodings],
+                      "attention_mask": [encoding.attention_mask for encoding in encodings],
+                  }
+
+              print("Tokenizing dataset...")
+              tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=num_proc)
+
+              print("Saving tokenized dataset...")
+              tokenized_dataset.save_to_disk(str(output_path))
+              PY
+          volumeMounts:
+            - name: fineweb-edu
+              mountPath: /data/fineweb-edu
+              readOnly: true
+            - name: tokenized-data
+              mountPath: /output/tokenized_data
+      volumes:
+        - name: fineweb-edu
+          hostPath:
+            path: /scratch/nfs_server/vunguyen13/ServicePackage/fineweb-edu
+            type: Directory
+        - name: tokenized-data
+          hostPath:
+            path: /scratch/nfs_server/vunguyen13/ServicePackage/tokenized_data
+            type: DirectoryOrCreate
