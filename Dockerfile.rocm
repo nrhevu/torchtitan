@@ -1,0 +1,12 @@
+FROM rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
+
+WORKDIR /workspace
+
+COPY requirements.txt .
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+COPY . /workspace/torchtitan
+RUN pip install --no-cache-dir -e /workspace/torchtitan
+
+CMD ["bash"]
