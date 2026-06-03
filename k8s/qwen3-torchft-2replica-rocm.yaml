@@ -1,0 +1,738 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: torchft-lighthouse
+  namespace: vunguyen13
+  labels:
+    app.kubernetes.io/name: qwen3-torchft
+    app.kubernetes.io/component: lighthouse
+spec:
+  selector:
+    app.kubernetes.io/name: qwen3-torchft
+    app.kubernetes.io/component: lighthouse
+  ports:
+    - name: http
+      port: 29510
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: torchft-lighthouse
+  namespace: vunguyen13
+  labels:
+    app.kubernetes.io/name: qwen3-torchft
+    app.kubernetes.io/component: lighthouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qwen3-torchft
+      app.kubernetes.io/component: lighthouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qwen3-torchft
+        app.kubernetes.io/component: lighthouse
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: lighthouse
+          image: 165.245.168.140:30088/mlops/torchft:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 29510
+              protocol: TCP
+          env:
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: TORCHFT_MIN_REPLICAS
+              value: "1"
+            - name: TORCHFT_QUORUM_TICK_MS
+              value: "10000"
+            - name: TORCHFT_JOIN_TIMEOUT_MS
+              value: "1000000"
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-torchft-r0-vu
+  namespace: vunguyen13
+  labels:
+    app.kubernetes.io/name: qwen3-torchft
+    app.kubernetes.io/component: trainer
+    app.kubernetes.io/instance: qwen3-torchft-r0-vu
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qwen3-torchft
+        app.kubernetes.io/component: trainer
+        app.kubernetes.io/instance: qwen3-torchft-r0-vu
+        torchft.replica-id: "0"
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 60
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - vu
+      initContainers:
+        - name: downloader
+          image: 165.245.168.140:30088/mlops/downloader:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: S3_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_URL
+            - name: S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_URL
+            - name: S3_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_ACCESS_TOKEN
+            - name: S3_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_SECRET_TOKEN
+            - name: S3_REGION
+              value: "us-east-1"
+            - name: S3_DATAHUB_BUCKET
+              value: data-dev-1-bucket
+            - name: DATASET_ID
+              value: ccef405c-c9a1-4484-afe7-9d493d8efc11
+            - name: DATASET_PATH
+              value: /shared/dataset
+          volumeMounts:
+            - name: dataset
+              mountPath: /shared/dataset
+        - name: tokenizer
+          image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: /workspace/torchtitan/assets/hf/cache
+            - name: HF_DATASETS_CACHE
+              value: /workspace/torchtitan/assets/hf/datasets
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: DATASET_PATH
+              value: /shared/dataset
+            - name: TOKENIZER_NAME
+              value: Qwen/Qwen3-4B
+            - name: OUTPUT_PATH
+              value: /workspace/torchtitan/tokenized_data
+            - name: NUM_PROC
+              value: "128"
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              python - <<'PY'
+              import os
+              from pathlib import Path
+
+              from datasets import load_dataset
+              from transformers import AutoTokenizer
+
+              dataset_path = os.environ["DATASET_PATH"]
+              tokenizer_name = os.environ["TOKENIZER_NAME"]
+              output_path = Path(os.environ["OUTPUT_PATH"])
+              num_proc = int(os.environ["NUM_PROC"])
+
+              if output_path.exists() and any(output_path.iterdir()):
+                  raise FileExistsError(
+                      f"{output_path} already exists and is not empty. "
+                      "Move or remove it before rerunning."
+                  )
+
+              output_path.mkdir(parents=True, exist_ok=True)
+
+              dataset = load_dataset(dataset_path)
+              tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+
+              def tokenize_function(examples):
+                  encodings = tokenizer.backend_tokenizer.encode_batch_fast(examples["text"])
+                  return {
+                      "input_ids": [encoding.ids for encoding in encodings],
+                      "attention_mask": [encoding.attention_mask for encoding in encodings],
+                  }
+
+              print("Tokenizing dataset...")
+              tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=num_proc)
+
+              print("Saving tokenized dataset...")
+              tokenized_dataset.save_to_disk(str(output_path))
+              PY
+          volumeMounts:
+            - name: dataset
+              mountPath: /shared/dataset
+              readOnly: true
+            - name: tokenized-data
+              mountPath: /workspace/torchtitan/tokenized_data
+            - name: hf-assets
+              mountPath: /workspace/torchtitan/assets/hf
+      containers:
+        - name: trainer
+          image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/torchtitan
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_PTRACE
+            seccompProfile:
+              type: Unconfined
+          resources:
+            requests:
+              amd.com/gpu: "8"
+            limits:
+              amd.com/gpu: "8"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NGPU
+              value: "8"
+            - name: ROCR_VISIBLE_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            - name: NODE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: MASTER_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: RDZV_PORT
+              value: "29500"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: TORCHFT_MANAGER_PORT
+              value: "29520"
+            - name: REPLICA_ID
+              value: "0"
+            - name: GROUP_SIZE
+              value: "2"
+            - name: RUN_SUFFIX
+              value: r0_vu
+            - name: RUN_NAME
+              value: qwen3_ft
+            - name: STEPS
+              value: "10000"
+            - name: TORCHTITAN_CONFIG_PATH
+              value: /tmp/qwen3_ft.toml
+            - name: TORCHFT_LIGHTHOUSE
+              value: "http://torchft-lighthouse.vunguyen13.svc.cluster.local:29510"
+            - name: TORCHFT_TIMEOUT_SEC
+              value: "120"
+            - name: TORCHFT_CONNECT_TIMEOUT_SEC
+              value: "120"
+            - name: TORCHFT_QUORUM_TIMEOUT_SEC
+              value: "120"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth1
+            - name: GLOO_SOCKET_IFNAME
+              value: eth1
+            - name: NCCL_P2P_DISABLE
+              value: "1"
+            - name: RUST_LOG
+              value: info
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_HOME
+              value: /workspace/torchtitan/assets/hf/cache
+            - name: TORCHTITAN_TOML
+              value: |
+                [job]
+                dump_folder = "./outputs/qwen3_ft"
+                description = "Qwen 3 0.6B tokenized dataset training"
+
+                [profiling]
+                enable_profiling = false
+
+                [metrics]
+                log_freq = 1
+                enable_tensorboard = false
+
+                [model]
+                name = "qwen3"
+                flavor = "0.6B"
+                hf_assets_path = "./assets/hf/Qwen3-0.6B"
+
+                [optimizer]
+                name = "AdamW"
+                lr = 3e-4
+                eps = 1e-8
+
+                [lr_scheduler]
+                warmup_steps = 1
+
+                [training]
+                local_batch_size = 1
+                seq_len = 128
+                max_norm = 1.0
+                steps = 10000
+                dataset = "tokenized_disk"
+                dataset_path = "./tokenized_data"
+
+                [parallelism]
+                data_parallel_replicate_degree = 1
+                data_parallel_shard_degree = -1
+                fsdp_reshard_after_forward = "default"
+                tensor_parallel_degree = 1
+                context_parallel_degree = 1
+
+                [checkpoint]
+                enable = false
+                folder = "checkpoint"
+                interval = 500
+                export_dtype = "float16"
+                async_mode = "disabled"
+
+                [activation_checkpoint]
+                mode = "selective"
+                selective_ac_option = "op"
+
+                [compile]
+                enable = false
+                components = ["model", "loss"]
+
+                [quantize.linear.float8]
+                enable_fsdp_float8_all_gather = false
+                precompute_float8_dynamic_scale_for_fsdp = false
+                filter_fqns = ["output"]
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              pip install torchft-nightly -q
+
+              mkdir -p "$(dirname "${TORCHTITAN_CONFIG_PATH}")" ./assets/hf "./outputs/${RUN_NAME}/${RUN_SUFFIX}"
+              if [ ! -f ./assets/hf/Qwen3-0.6B/tokenizer.json ]; then
+                python scripts/download_hf_assets.py \
+                  --repo_id Qwen/Qwen3-0.6B \
+                  --local_dir ./assets/hf \
+                  --assets tokenizer
+              fi
+
+              printf '%s\n' "${TORCHTITAN_TOML}" > "${TORCHTITAN_CONFIG_PATH}"
+
+              torchrun \
+                --nproc_per_node="${NGPU}" \
+                --rdzv_backend c10d \
+                --rdzv_endpoint="${NODE_ADDR}:${RDZV_PORT}" \
+                --local-ranks-filter 0 \
+                --role rank \
+                --tee 3 \
+                -m torchtitan.experiments.ft.train \
+                --job.config_file "${TORCHTITAN_CONFIG_PATH}" \
+                --job.dump_folder "./outputs/${RUN_NAME}/${RUN_SUFFIX}" \
+                --fault_tolerance.enable \
+                --fault_tolerance.replica_id="${REPLICA_ID}" \
+                --fault_tolerance.group_size="${GROUP_SIZE}" \
+                --fault_tolerance.min_replica_size=1 \
+                --fault_tolerance.process_group=gloo \
+                --fault_tolerance.process_group_timeout_ms=120000 \
+                --training.steps="${STEPS}"
+          volumeMounts:
+            - name: tokenized-data
+              mountPath: /workspace/torchtitan/tokenized_data
+            - name: hf-assets
+              mountPath: /workspace/torchtitan/assets/hf
+            - name: output
+              mountPath: /workspace/torchtitan/outputs
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dataset
+          emptyDir: {}
+        - name: tokenized-data
+          emptyDir: {}
+        - name: hf-assets
+          emptyDir: {}
+        - name: output
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-torchft-r1-son
+  namespace: vunguyen13
+  labels:
+    app.kubernetes.io/name: qwen3-torchft
+    app.kubernetes.io/component: trainer
+    app.kubernetes.io/instance: qwen3-torchft-r1-son
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qwen3-torchft
+        app.kubernetes.io/component: trainer
+        app.kubernetes.io/instance: qwen3-torchft-r1-son
+        torchft.replica-id: "1"
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 60
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - son-le5-mlops-ubuntu-gpu-mi350x8-2304gb-ric1
+      initContainers:
+        - name: downloader
+          image: 165.245.168.140:30088/mlops/downloader:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: S3_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_URL
+            - name: S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_URL
+            - name: S3_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_ACCESS_TOKEN
+            - name: S3_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-s3-credentials
+                  key: S3_SECRET_TOKEN
+            - name: S3_REGION
+              value: "us-east-1"
+            - name: S3_DATAHUB_BUCKET
+              value: data-dev-1-bucket
+            - name: DATASET_ID
+              value: ccef405c-c9a1-4484-afe7-9d493d8efc11
+            - name: DATASET_PATH
+              value: /shared/dataset
+          volumeMounts:
+            - name: dataset
+              mountPath: /shared/dataset
+        - name: tokenizer
+          image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: /workspace/torchtitan/assets/hf/cache
+            - name: HF_DATASETS_CACHE
+              value: /workspace/torchtitan/assets/hf/datasets
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: DATASET_PATH
+              value: /shared/dataset
+            - name: TOKENIZER_NAME
+              value: Qwen/Qwen3-4B
+            - name: OUTPUT_PATH
+              value: /workspace/torchtitan/tokenized_data
+            - name: NUM_PROC
+              value: "128"
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              python - <<'PY'
+              import os
+              from pathlib import Path
+
+              from datasets import load_dataset
+              from transformers import AutoTokenizer
+
+              dataset_path = os.environ["DATASET_PATH"]
+              tokenizer_name = os.environ["TOKENIZER_NAME"]
+              output_path = Path(os.environ["OUTPUT_PATH"])
+              num_proc = int(os.environ["NUM_PROC"])
+
+              if output_path.exists() and any(output_path.iterdir()):
+                  raise FileExistsError(
+                      f"{output_path} already exists and is not empty. "
+                      "Move or remove it before rerunning."
+                  )
+
+              output_path.mkdir(parents=True, exist_ok=True)
+
+              dataset = load_dataset(dataset_path)
+              tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+
+              def tokenize_function(examples):
+                  encodings = tokenizer.backend_tokenizer.encode_batch_fast(examples["text"])
+                  return {
+                      "input_ids": [encoding.ids for encoding in encodings],
+                      "attention_mask": [encoding.attention_mask for encoding in encodings],
+                  }
+
+              print("Tokenizing dataset...")
+              tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=num_proc)
+
+              print("Saving tokenized dataset...")
+              tokenized_dataset.save_to_disk(str(output_path))
+              PY
+          volumeMounts:
+            - name: dataset
+              mountPath: /shared/dataset
+              readOnly: true
+            - name: tokenized-data
+              mountPath: /workspace/torchtitan/tokenized_data
+            - name: hf-assets
+              mountPath: /workspace/torchtitan/assets/hf
+      containers:
+        - name: trainer
+          image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/torchtitan
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_PTRACE
+            seccompProfile:
+              type: Unconfined
+          resources:
+            requests:
+              amd.com/gpu: "8"
+            limits:
+              amd.com/gpu: "8"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NGPU
+              value: "8"
+            - name: ROCR_VISIBLE_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            - name: NODE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: MASTER_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: RDZV_PORT
+              value: "29501"
+            - name: MASTER_PORT
+              value: "29501"
+            - name: TORCHFT_MANAGER_PORT
+              value: "29521"
+            - name: REPLICA_ID
+              value: "1"
+            - name: GROUP_SIZE
+              value: "2"
+            - name: RUN_SUFFIX
+              value: r1_son
+            - name: RUN_NAME
+              value: qwen3_ft
+            - name: STEPS
+              value: "10000"
+            - name: TORCHTITAN_CONFIG_PATH
+              value: /tmp/qwen3_ft.toml
+            - name: TORCHFT_LIGHTHOUSE
+              value: "http://torchft-lighthouse.vunguyen13.svc.cluster.local:29510"
+            - name: TORCHFT_TIMEOUT_SEC
+              value: "120"
+            - name: TORCHFT_CONNECT_TIMEOUT_SEC
+              value: "120"
+            - name: TORCHFT_QUORUM_TIMEOUT_SEC
+              value: "120"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth1
+            - name: GLOO_SOCKET_IFNAME
+              value: eth1
+            - name: NCCL_P2P_DISABLE
+              value: "1"
+            - name: RUST_LOG
+              value: info
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_HOME
+              value: /workspace/torchtitan/assets/hf/cache
+            - name: TORCHTITAN_TOML
+              value: |
+                [job]
+                dump_folder = "./outputs/qwen3_ft"
+                description = "Qwen 3 0.6B tokenized dataset training"
+
+                [profiling]
+                enable_profiling = false
+
+                [metrics]
+                log_freq = 1
+                enable_tensorboard = false
+
+                [model]
+                name = "qwen3"
+                flavor = "0.6B"
+                hf_assets_path = "./assets/hf/Qwen3-0.6B"
+
+                [optimizer]
+                name = "AdamW"
+                lr = 3e-4
+                eps = 1e-8
+
+                [lr_scheduler]
+                warmup_steps = 1
+
+                [training]
+                local_batch_size = 1
+                seq_len = 128
+                max_norm = 1.0
+                steps = 10000
+                dataset = "tokenized_disk"
+                dataset_path = "./tokenized_data"
+
+                [parallelism]
+                data_parallel_replicate_degree = 1
+                data_parallel_shard_degree = -1
+                fsdp_reshard_after_forward = "default"
+                tensor_parallel_degree = 1
+                context_parallel_degree = 1
+
+                [checkpoint]
+                enable = false
+                folder = "checkpoint"
+                interval = 500
+                export_dtype = "float16"
+                async_mode = "disabled"
+
+                [activation_checkpoint]
+                mode = "selective"
+                selective_ac_option = "op"
+
+                [compile]
+                enable = false
+                components = ["model", "loss"]
+
+                [quantize.linear.float8]
+                enable_fsdp_float8_all_gather = false
+                precompute_float8_dynamic_scale_for_fsdp = false
+                filter_fqns = ["output"]
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              pip install torchft-nightly -q
+
+              mkdir -p "$(dirname "${TORCHTITAN_CONFIG_PATH}")" ./assets/hf "./outputs/${RUN_NAME}/${RUN_SUFFIX}"
+              if [ ! -f ./assets/hf/Qwen3-0.6B/tokenizer.json ]; then
+                python scripts/download_hf_assets.py \
+                  --repo_id Qwen/Qwen3-0.6B \
+                  --local_dir ./assets/hf \
+                  --assets tokenizer
+              fi
+
+              printf '%s\n' "${TORCHTITAN_TOML}" > "${TORCHTITAN_CONFIG_PATH}"
+
+              torchrun \
+                --nproc_per_node="${NGPU}" \
+                --rdzv_backend c10d \
+                --rdzv_endpoint="${NODE_ADDR}:${RDZV_PORT}" \
+                --local-ranks-filter 0 \
+                --role rank \
+                --tee 3 \
+                -m torchtitan.experiments.ft.train \
+                --job.config_file "${TORCHTITAN_CONFIG_PATH}" \
+                --job.dump_folder "./outputs/${RUN_NAME}/${RUN_SUFFIX}" \
+                --fault_tolerance.enable \
+                --fault_tolerance.replica_id="${REPLICA_ID}" \
+                --fault_tolerance.group_size="${GROUP_SIZE}" \
+                --fault_tolerance.min_replica_size=1 \
+                --fault_tolerance.process_group=gloo \
+                --fault_tolerance.process_group_timeout_ms=120000 \
+                --training.steps="${STEPS}"
+          volumeMounts:
+            - name: tokenized-data
+              mountPath: /workspace/torchtitan/tokenized_data
+            - name: hf-assets
+              mountPath: /workspace/torchtitan/assets/hf
+            - name: output
+              mountPath: /workspace/torchtitan/outputs
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dataset
+          emptyDir: {}
+        - name: tokenized-data
+          emptyDir: {}
+        - name: hf-assets
+          emptyDir: {}
+        - name: output
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
