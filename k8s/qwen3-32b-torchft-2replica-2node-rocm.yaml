@@ -83,137 +83,6 @@ spec:
               drop:
                 - ALL
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: qwen3-32b-torchft-2node-scripts
-  namespace: vunguyen13
-  labels:
-    app.kubernetes.io/name: qwen3-32b-torchft-2node
-    app.kubernetes.io/component: scripts
-data:
-  tokenize_dataset.py: |
-    import os
-    from pathlib import Path
-
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-
-    dataset_path = os.environ["DATASET_PATH"]
-    tokenizer_name = os.environ["TOKENIZER_NAME"]
-    output_path = Path(os.environ["OUTPUT_PATH"])
-    num_proc = int(os.environ["NUM_PROC"])
-    max_train_samples = int(os.environ.get("MAX_TRAIN_SAMPLES", "0"))
-
-    if output_path.exists() and any(output_path.iterdir()):
-        raise FileExistsError(
-            f"{output_path} already exists and is not empty. Move or remove it before rerunning."
-        )
-
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    dataset = load_dataset(dataset_path, split="train")
-    if max_train_samples > 0:
-        sample_count = min(max_train_samples, len(dataset))
-        print(f"Selecting first {sample_count} examples for this smoke run...")
-        dataset = dataset.select(range(sample_count))
-
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-
-    def tokenize_function(examples):
-        encodings = tokenizer.backend_tokenizer.encode_batch_fast(examples["text"])
-        return {
-            "input_ids": [encoding.ids for encoding in encodings],
-            "attention_mask": [encoding.attention_mask for encoding in encodings],
-        }
-
-    print("Tokenizing dataset...")
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=num_proc)
-
-    print("Saving tokenized dataset...")
-    tokenized_dataset.save_to_disk(str(output_path))
-  train-multinode.sh: |
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    export RDZV_PORT="$((RDZV_BASE_PORT + REPLICA_ID))"
-    export TORCHFT_MANAGER_PORT="$((TORCHFT_MANAGER_BASE_PORT + (REPLICA_ID * NNODES) + NODE_RANK))"
-    # Kubernetes allocates 4 physical GPUs per pod. Inside the pod they are addressed as local ordinals 0..3.
-
-    case "${REPLICA_ID}" in
-          0)
-            export HIP_VISIBLE_DEVICES="0,1,2,3"
-            ;;
-          1)
-            export HIP_VISIBLE_DEVICES="4,5,6,7"
-            ;;
-        esac
-    export MASTER_PORT="${RDZV_PORT}"
-    export RUN_SUFFIX="r${REPLICA_ID}"
-    export TRAIN_OUTPUT_DIR="./outputs/${RUN_NAME}/${RUN_SUFFIX}"
-    export TRAIN_LOG="${TRAIN_OUTPUT_DIR}/trainer-node${NODE_RANK}.log"
-
-    mkdir -p "$(dirname "${TORCHTITAN_CONFIG_PATH}")" ./assets/hf "${TRAIN_OUTPUT_DIR}"
-
-    cat <<EOF
-    TorchFT trainer environment
-      replica_id=${REPLICA_ID}
-      group_size=${GROUP_SIZE}
-      node_rank=${NODE_RANK}
-      nnodes=${NNODES}
-      ngpu=${NGPU}
-      rocr_visible_devices=${ROCR_VISIBLE_DEVICES:-unset}
-      hip_visible_devices=${HIP_VISIBLE_DEVICES:-unset}
-      cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}
-      rdzv_host_rank=${RDZV_HOST_RANK}
-      master_addr=${MASTER_ADDR}
-      rdzv_port=${RDZV_PORT}
-      master_port=${MASTER_PORT}
-      torchft_manager_port=${TORCHFT_MANAGER_PORT}
-      node_addr=${NODE_ADDR:-unknown}
-      pod=${POD_NAME:-unknown}
-      job=${JOB_NAME:-unknown}
-    EOF
-
-    pip install torchft-nightly -q
-
-    if [ ! -f ./assets/hf/Qwen3-32B/tokenizer.json ]; then
-      python scripts/download_hf_assets.py \
-        --repo_id Qwen/Qwen3-32B \
-        --local_dir ./assets/hf \
-        --assets tokenizer
-    fi
-
-    printf '%s\n' "${TORCHTITAN_TOML}" > "${TORCHTITAN_CONFIG_PATH}"
-
-    set +e
-    torchrun \
-      --nnodes="${NNODES}" \
-      --node_rank="${NODE_RANK}" \
-      --nproc_per_node="${NGPU}" \
-      --rdzv_backend c10d \
-      --rdzv_id="${RUN_NAME}_replica_${REPLICA_ID}" \
-      --rdzv_endpoint="${MASTER_ADDR}:${RDZV_PORT}" \
-      --local-ranks-filter 0 \
-      --role rank \
-      --tee 3 \
-      -m torchtitan.experiments.ft.train \
-      --job.config_file "${TORCHTITAN_CONFIG_PATH}" \
-      --job.dump_folder "${TRAIN_OUTPUT_DIR}" \
-      --fault_tolerance.enable \
-      --fault_tolerance.replica_id="${REPLICA_ID}" \
-      --fault_tolerance.group_size="${GROUP_SIZE}" \
-      --fault_tolerance.min_replica_size=1 \
-      --fault_tolerance.process_group=gloo \
-      --fault_tolerance.process_group_timeout_ms=120000 \
-      --training.steps="${STEPS}" \
-      2>&1 | tee "${TRAIN_LOG}"
-    train_status=${PIPESTATUS[0]}
-    set -e
-
-    find "${TRAIN_OUTPUT_DIR}" -maxdepth 6 -print | sort | tee "${TRAIN_OUTPUT_DIR}/output-listing-node${NODE_RANK}.txt"
-    exit "${train_status}"
----
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -313,7 +182,7 @@ spec:
                       mountPath: /shared/dataset
                 - name: tokenizer
                   image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
-                  imagePullPolicy: IfNotPresent
+                  imagePullPolicy: Always
                   workingDir: /workspace
                   env:
                     - name: PYTHONUNBUFFERED
@@ -336,7 +205,7 @@ spec:
                       value: "200000"
                   command:
                     - python
-                    - /scripts/tokenize_dataset.py
+                    - /workspace/torchtitan/scripts/tokenize_dataset.py
                   volumeMounts:
                     - name: dataset
                       mountPath: /shared/dataset
@@ -345,13 +214,10 @@ spec:
                       mountPath: /workspace/torchtitan/tokenized_data
                     - name: hf-assets
                       mountPath: /workspace/torchtitan/assets/hf
-                    - name: scripts
-                      mountPath: /scripts
-                      readOnly: true
               containers:
                 - name: trainer
                   image: 165.245.168.140:30088/training-workloads/torchtitan:rocm7.2.4
-                  imagePullPolicy: IfNotPresent
+                  imagePullPolicy: Always
                   workingDir: /workspace/torchtitan
                   securityContext:
                     privileged: true
@@ -450,71 +316,73 @@ spec:
                       value: "expandable_segments:True"
                     - name: HF_HOME
                       value: /workspace/torchtitan/assets/hf/cache
-                    - name: TORCHTITAN_TOML
+                    - name: HYPERPARAMETERS
                       value: |
-                        [job]
-                        dump_folder = "./outputs/qwen3_32b_ft_2node"
-                        description = "Qwen3 32B TorchFT training, JobSet replicas with two nodes per replica"
-
-                        [profiling]
-                        enable_profiling = false
-
-                        [metrics]
-                        log_freq = 1
-                        enable_tensorboard = false
-
-                        [model]
-                        name = "qwen3"
-                        flavor = "32B"
-                        hf_assets_path = "./assets/hf/Qwen3-32B"
-
-                        [optimizer]
-                        name = "AdamW"
-                        lr = 3.0e-4
-                        eps = 1.0e-8
-
-                        [lr_scheduler]
-                        warmup_steps = 2
-
-                        [training]
-                        local_batch_size = 4
-                        seq_len = 4096
-                        max_norm = 1.0
-                        steps = 100
-                        dataset = "tokenized_disk"
-                        dataset_path = "./tokenized_data"
-
-                        [parallelism]
-                        data_parallel_replicate_degree = 1
-                        data_parallel_shard_degree = -1
-                        fsdp_reshard_after_forward = "default"
-                        tensor_parallel_degree = 1
-                        context_parallel_degree = 1
-
-                        [checkpoint]
-                        enable = false
-                        folder = "checkpoint"
-                        interval = 50
-                        last_save_model_only = false
-                        export_dtype = "float16"
-                        async_mode = "disabled"
-                        keep_latest_k = 0
-
-                        [activation_checkpoint]
-                        mode = "full"
-                        selective_ac_option = "op"
-
-                        [compile]
-                        enable = true
-                        components = ["model", "loss"]
-
-                        # [quantize.linear.float8]
-                        # enable_fsdp_float8_all_gather = false
-                        # precompute_float8_dynamic_scale_for_fsdp = false
-                        # filter_fqns = ["output"]
+                        {
+                          "job": {
+                            "dump_folder": "./outputs/qwen3_32b_ft_2node",
+                            "description": "Qwen3 32B TorchFT training, JobSet replicas with two nodes per replica"
+                          },
+                          "profiling": {
+                            "enable_profiling": false
+                          },
+                          "metrics": {
+                            "log_freq": 1,
+                            "enable_tensorboard": false
+                          },
+                          "model": {
+                            "name": "qwen3",
+                            "flavor": "32B",
+                            "hf_assets_path": "./assets/hf/Qwen3-32B"
+                          },
+                          "optimizer": {
+                            "name": "AdamW",
+                            "lr": 3.0e-4,
+                            "eps": 1.0e-8
+                          },
+                          "lr_scheduler": {
+                            "warmup_steps": 2
+                          },
+                          "training": {
+                            "local_batch_size": 4,
+                            "seq_len": 4096,
+                            "max_norm": 1.0,
+                            "steps": 100,
+                            "dataset": "tokenized_disk",
+                            "dataset_path": "./tokenized_data"
+                          },
+                          "parallelism": {
+                            "data_parallel_replicate_degree": 1,
+                            "data_parallel_shard_degree": -1,
+                            "fsdp_reshard_after_forward": "default",
+                            "tensor_parallel_degree": 1,
+                            "context_parallel_degree": 1
+                          },
+                          "checkpoint": {
+                            "enable": false,
+                            "folder": "checkpoint",
+                            "interval": 50,
+                            "last_save_model_only": false,
+                            "export_dtype": "float16",
+                            "async_mode": "disabled",
+                            "keep_latest_k": 0
+                          },
+                          "activation_checkpoint": {
+                            "mode": "full",
+                            "selective_ac_option": "op"
+                          },
+                          "compile": {
+                            "enable": true,
+                            "components": ["model", "loss"]
+                          }
+                        }
                   command:
                     - bash
-                    - /scripts/train-multinode.sh
+                    - -lc
+                  args:
+                    - |
+                      python /workspace/torchtitan/scripts/write_json2toml.py
+                      exec bash /workspace/torchtitan/scripts/train-multinode.sh
                   volumeMounts:
                     - name: tokenized-data
                       mountPath: /workspace/torchtitan/tokenized_data
@@ -522,9 +390,6 @@ spec:
                       mountPath: /workspace/torchtitan/assets/hf
                     - name: output
                       mountPath: /workspace/torchtitan/outputs
-                    - name: scripts
-                      mountPath: /scripts
-                      readOnly: true
                     - name: dshm
                       mountPath: /dev/shm
               volumes:
@@ -536,9 +401,6 @@ spec:
                   emptyDir: {}
                 - name: output
                   emptyDir: {}
-                - name: scripts
-                  configMap:
-                    name: qwen3-32b-torchft-2node-scripts
                 - name: dshm
                   emptyDir:
                     medium: Memory
