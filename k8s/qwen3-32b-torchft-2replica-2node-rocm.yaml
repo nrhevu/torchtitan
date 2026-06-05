@@ -36,6 +36,8 @@ spec:
         app.kubernetes.io/name: qwen3-32b-torchft-2node
         app.kubernetes.io/component: lighthouse
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -134,67 +136,18 @@ data:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if [[ -z "${REPLICA_ID:-}" && -n "${JOB_INDEX:-}" ]]; then
-      export REPLICA_ID="${JOB_INDEX}"
-    fi
-    if [[ -z "${REPLICA_ID:-}" && -n "${JOB_NAME:-}" && "${JOB_NAME}" =~ -([0-9]+)$ ]]; then
-      export REPLICA_ID="${BASH_REMATCH[1]}"
-    fi
-    if [[ -z "${NODE_RANK:-}" && -n "${JOB_COMPLETION_INDEX:-}" ]]; then
-      export NODE_RANK="${JOB_COMPLETION_INDEX}"
-    fi
+    export RDZV_PORT="$((RDZV_BASE_PORT + REPLICA_ID))"
+    export TORCHFT_MANAGER_PORT="$((TORCHFT_MANAGER_BASE_PORT + (REPLICA_ID * NNODES) + NODE_RANK))"
+    # Kubernetes allocates 4 physical GPUs per pod. Inside the pod they are addressed as local ordinals 0..3.
 
-    : "${REPLICA_ID:?REPLICA_ID is required}"
-    : "${GROUP_SIZE:?GROUP_SIZE is required}"
-    : "${NODE_RANK:?NODE_RANK is required}"
-    : "${NNODES:?NNODES is required}"
-    : "${NGPU:?NGPU is required}"
-    : "${RDZV_BASE_PORT:?RDZV_BASE_PORT is required}"
-    : "${TORCHFT_MANAGER_BASE_PORT:?TORCHFT_MANAGER_BASE_PORT is required}"
-    : "${JOBSET_NAME:?JOBSET_NAME is required}"
-    : "${REPLICATED_JOB_NAME:?REPLICATED_JOB_NAME is required}"
-    : "${JOBSET_SUBDOMAIN:?JOBSET_SUBDOMAIN is required}"
-    : "${POD_NAMESPACE:?POD_NAMESPACE is required}"
-    : "${RUN_NAME:?RUN_NAME is required}"
-    : "${STEPS:?STEPS is required}"
-    : "${CHECKPOINT_INTERVAL:?CHECKPOINT_INTERVAL is required}"
-
-    for numeric_name in REPLICA_ID GROUP_SIZE NODE_RANK NNODES NGPU RDZV_BASE_PORT TORCHFT_MANAGER_BASE_PORT STEPS CHECKPOINT_INTERVAL; do
-      numeric_value="${!numeric_name:-}"
-      if ! [[ "${numeric_value}" =~ ^[0-9]+$ ]]; then
-        echo "${numeric_name} must be numeric, got '${numeric_value}'" >&2
-        exit 1
-      fi
-    done
-    if (( GROUP_SIZE < 1 )); then
-      echo "GROUP_SIZE must be at least 1" >&2
-      exit 1
-    fi
-    if (( REPLICA_ID >= GROUP_SIZE )); then
-      echo "REPLICA_ID=${REPLICA_ID} must be smaller than GROUP_SIZE=${GROUP_SIZE}" >&2
-      exit 1
-    fi
-    if (( NNODES < 1 )); then
-      echo "NNODES must be at least 1" >&2
-      exit 1
-    fi
-    if (( NODE_RANK >= NNODES )); then
-      echo "NODE_RANK=${NODE_RANK} must be smaller than NNODES=${NNODES}" >&2
-      exit 1
-    fi
-
-    export RDZV_PORT="${RDZV_PORT:-$((RDZV_BASE_PORT + REPLICA_ID))}"
-    export TORCHFT_MANAGER_PORT="${TORCHFT_MANAGER_PORT:-$((TORCHFT_MANAGER_BASE_PORT + (REPLICA_ID * NNODES) + NODE_RANK))}"
-    export MASTER_ADDR="${MASTER_ADDR:-${JOBSET_NAME}-${REPLICATED_JOB_NAME}-${REPLICA_ID}-0.${JOBSET_SUBDOMAIN}.${POD_NAMESPACE}.svc.cluster.local}"
-
-    for numeric_name in RDZV_PORT TORCHFT_MANAGER_PORT; do
-      numeric_value="${!numeric_name:-}"
-      if ! [[ "${numeric_value}" =~ ^[0-9]+$ ]]; then
-        echo "${numeric_name} must be numeric, got '${numeric_value}'" >&2
-        exit 1
-      fi
-    done
-
+    case "${REPLICA_ID}" in
+          0)
+            export HIP_VISIBLE_DEVICES="0,1,2,3"
+            ;;
+          1)
+            export HIP_VISIBLE_DEVICES="4,5,6,7"
+            ;;
+        esac
     export MASTER_PORT="${RDZV_PORT}"
     export RUN_SUFFIX="r${REPLICA_ID}"
     export TRAIN_OUTPUT_DIR="./outputs/${RUN_NAME}/${RUN_SUFFIX}"
@@ -202,7 +155,25 @@ data:
 
     mkdir -p "$(dirname "${TORCHTITAN_CONFIG_PATH}")" ./assets/hf "${TRAIN_OUTPUT_DIR}"
 
-    echo "TorchFT replica ${REPLICA_ID}/${GROUP_SIZE}; node_rank=${NODE_RANK}/${NNODES}; nproc_per_node=${NGPU}; rdzv=${MASTER_ADDR}:${RDZV_PORT}; manager_port=${TORCHFT_MANAGER_PORT}; host_ip=${NODE_ADDR:-unknown}; pod=${POD_NAME:-unknown}; job=${JOB_NAME:-unknown}"
+    cat <<EOF
+    TorchFT trainer environment
+      replica_id=${REPLICA_ID}
+      group_size=${GROUP_SIZE}
+      node_rank=${NODE_RANK}
+      nnodes=${NNODES}
+      ngpu=${NGPU}
+      rocr_visible_devices=${ROCR_VISIBLE_DEVICES:-unset}
+      hip_visible_devices=${HIP_VISIBLE_DEVICES:-unset}
+      cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}
+      rdzv_host_rank=${RDZV_HOST_RANK}
+      master_addr=${MASTER_ADDR}
+      rdzv_port=${RDZV_PORT}
+      master_port=${MASTER_PORT}
+      torchft_manager_port=${TORCHFT_MANAGER_PORT}
+      node_addr=${NODE_ADDR:-unknown}
+      pod=${POD_NAME:-unknown}
+      job=${JOB_NAME:-unknown}
+    EOF
 
     pip install torchft-nightly -q
 
@@ -391,9 +362,13 @@ spec:
                       type: Unconfined
                   resources:
                     requests:
-                      amd.com/gpu: "4"
+                      cpu: "16"
+                      memory: "128Gi"
+                      amd.com/gpu: 4
                     limits:
-                      amd.com/gpu: "4"
+                      cpu: "32"
+                      memory: "256Gi"
+                      amd.com/gpu: 4
                   env:
                     - name: NODE_ADDR
                       valueFrom:
@@ -419,6 +394,10 @@ spec:
                       valueFrom:
                         fieldRef:
                           fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+                    - name: REPLICA_ID
+                      value: "$(JOB_INDEX)"
+                    - name: NODE_RANK
+                      value: "$(JOB_COMPLETION_INDEX)"
                     - name: PYTHONUNBUFFERED
                       value: "1"
                     - name: JOBSET_NAME
@@ -427,6 +406,10 @@ spec:
                       value: qwen3-32b-torchft-2node
                     - name: REPLICATED_JOB_NAME
                       value: replica
+                    - name: RDZV_HOST_RANK
+                      value: "0"
+                    - name: MASTER_ADDR
+                      value: "$(JOBSET_NAME)-$(REPLICATED_JOB_NAME)-$(JOB_INDEX)-$(RDZV_HOST_RANK).$(JOBSET_SUBDOMAIN).$(POD_NAMESPACE).svc.cluster.local"
                     - name: NNODES
                       value: "2"
                     - name: NGPU
@@ -487,15 +470,15 @@ spec:
 
                         [optimizer]
                         name = "AdamW"
-                        lr = 8e-4
-                        eps = 1e-8
+                        lr = 3.0e-4
+                        eps = 1.0e-8
 
                         [lr_scheduler]
-                        warmup_steps = 1
+                        warmup_steps = 2
 
                         [training]
-                        local_batch_size = 1
-                        seq_len = 128
+                        local_batch_size = 4
+                        seq_len = 4096
                         max_norm = 1.0
                         steps = 100
                         dataset = "tokenized_disk"
@@ -522,13 +505,13 @@ spec:
                         selective_ac_option = "op"
 
                         [compile]
-                        enable = false
+                        enable = true
                         components = ["model", "loss"]
 
-                        [quantize.linear.float8]
-                        enable_fsdp_float8_all_gather = false
-                        precompute_float8_dynamic_scale_for_fsdp = false
-                        filter_fqns = ["output"]
+                        # [quantize.linear.float8]
+                        # enable_fsdp_float8_all_gather = false
+                        # precompute_float8_dynamic_scale_for_fsdp = false
+                        # filter_fqns = ["output"]
                   command:
                     - bash
                     - /scripts/train-multinode.sh
