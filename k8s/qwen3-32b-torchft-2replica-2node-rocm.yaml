@@ -212,7 +212,7 @@ spec:
                       readOnly: true
                     - name: tokenized-data
                       mountPath: /workspace/torchtitan/tokenized_data
-                    - name: hf-assets
+                    - name: model-assets
                       mountPath: /workspace/torchtitan/assets/hf
               containers:
                 - name: trainer
@@ -316,7 +316,7 @@ spec:
                       value: "expandable_segments:True"
                     - name: HF_HOME
                       value: /workspace/torchtitan/assets/hf/cache
-                    - name: HYPERPARAMETERS
+                    - name: SYSTEM_PARAMETERS
                       value: |
                         {
                           "job": {
@@ -335,6 +335,27 @@ spec:
                             "flavor": "32B",
                             "hf_assets_path": "./assets/hf/Qwen3-32B"
                           },
+                          "training": {
+                            "dataset": "tokenized_disk",
+                            "dataset_path": "./tokenized_data"
+                          },
+                          "checkpoint": {
+                            "enable": true,
+                            "folder": "checkpoint",
+                            "last_save_model_only": false
+                          },
+                          "activation_checkpoint": {
+                            "mode": "full",
+                            "selective_ac_option": "op"
+                          },
+                          "compile": {
+                            "enable": true,
+                            "components": ["model", "loss"]
+                          }
+                        }
+                    - name: HYPERPARAMETERS
+                      value: |
+                        {
                           "optimizer": {
                             "name": "AdamW",
                             "lr": 3.0e-4,
@@ -347,9 +368,7 @@ spec:
                             "local_batch_size": 4,
                             "seq_len": 4096,
                             "max_norm": 1.0,
-                            "steps": 100,
-                            "dataset": "tokenized_disk",
-                            "dataset_path": "./tokenized_data"
+                            "steps": 100
                           },
                           "parallelism": {
                             "data_parallel_replicate_degree": 1,
@@ -359,10 +378,7 @@ spec:
                             "context_parallel_degree": 1
                           },
                           "checkpoint": {
-                            "enable": false,
-                            "folder": "checkpoint",
                             "interval": 50,
-                            "last_save_model_only": false,
                             "export_dtype": "float16",
                             "async_mode": "disabled",
                             "keep_latest_k": 0
@@ -381,12 +397,14 @@ spec:
                     - -lc
                   args:
                     - |
+                      export FINAL_CONFIG=$(jq -n --argjson j1 "$SYSTEM_PARAMETERS" --argjson j2 "$HYPERPARAMETERS" '$j1 * $j2' | jq .)
+                      echo $FINAL_CONFIG
                       python /workspace/torchtitan/scripts/write_json2toml.py
                       exec bash /workspace/torchtitan/scripts/train-multinode.sh
                   volumeMounts:
                     - name: tokenized-data
                       mountPath: /workspace/torchtitan/tokenized_data
-                    - name: hf-assets
+                    - name: model-assets
                       mountPath: /workspace/torchtitan/assets/hf
                     - name: output
                       mountPath: /workspace/torchtitan/outputs
@@ -397,7 +415,7 @@ spec:
                   emptyDir: {}
                 - name: tokenized-data
                   emptyDir: {}
-                - name: hf-assets
+                - name: model-assets
                   emptyDir: {}
                 - name: output
                   emptyDir: {}

@@ -49,9 +49,7 @@ def emit_table(lines, path, table):
         if index != len(child_items) - 1:
             lines.append("")
 
-config = json.loads(os.environ["HYPERPARAMETERS"])
-if not isinstance(config, dict):
-    raise TypeError("HYPERPARAMETERS must be a JSON object")
+config = json.loads(os.environ["FINAL_CONFIG"])
 
 lines = []
 emit_table(lines, [], config)
