@@ -8,7 +8,9 @@ import importlib
 import os
 import sys
 import warnings
+from collections.abc import Mapping
 from dataclasses import field, fields, is_dataclass, make_dataclass
+from pathlib import Path
 from typing import Any
 
 import tyro
@@ -18,13 +20,16 @@ from torchtitan.tools.logging import logger
 
 class ConfigManager:
     """
-    Parses, merges, and validates a config from --module/--config and CLI sources.
+    Parses, merges, and validates a config from --module/--config,
+    --config-file, and CLI sources.
 
     Configuration precedence:
-        CLI args > config_registry function defaults
+        CLI args > YAML config file > config_registry function defaults
 
     --module selects the module (e.g., llama3, deepseek_v3).
     --config selects a config_registry function (e.g., llama3_debugmodel).
+    --config-file selects a YAML file that points at a config_registry function
+    and overlays config values.
     CLI arguments use the format <section>.<key> to override config values.
     """
 
@@ -44,21 +49,30 @@ class ConfigManager:
         return self.config
 
     def _load_config(self, args: list[str]) -> tuple[object, list[str]]:
-        """Parse --module and --config from args, load config from config_registry.
+        """Load config from --config-file or from --module/--config.
 
-        Both --module and --config are required.
-        Returns (loaded_config, filtered_args) with --module/--config stripped.
+        Returns (loaded_config, filtered_args) with config source args stripped.
         """
         module_name = None
         config_name = None
+        config_file = None
         filtered_args = []
 
         i = 0
         while i < len(args):
             arg = args[i]
 
+            # Handle --config-file=X, --config_file=X, and split forms.
+            if arg.startswith(("--config-file=", "--config_file=")):
+                config_file = arg.split("=", 1)[1]
+            elif arg in ("--config-file", "--config_file"):
+                if i + 1 < len(args):
+                    config_file = args[i + 1]
+                    i += 1
+                else:
+                    raise ValueError(f"{arg} requires a value")
             # Handle --module=X and --module X forms
-            if arg.startswith("--module="):
+            elif arg.startswith("--module="):
                 module_name = arg.split("=", 1)[1]
             elif arg == "--module":
                 if i + 1 < len(args):
@@ -80,6 +94,13 @@ class ConfigManager:
 
             i += 1
 
+        if config_file is not None:
+            if module_name is not None or config_name is not None:
+                raise ValueError(
+                    "--config-file cannot be combined with --module or --config"
+                )
+            return self._load_config_file(config_file), filtered_args
+
         if module_name is None:
             raise ValueError(
                 "--module is required. Example: --module llama3 --config llama3_debugmodel"
@@ -89,6 +110,95 @@ class ConfigManager:
                 "--config is required. Example: --module llama3 --config llama3_debugmodel"
             )
 
+        return self._load_registry_config(module_name, config_name), filtered_args
+
+    def _load_config_file(self, config_file: str) -> object:
+        """Load a YAML config file that selects and overlays a registry config."""
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(
+                "--config-file requires PyYAML. Install it with `pip install PyYAML`."
+            ) from exc
+
+        config_path = Path(config_file).expanduser()
+        with config_path.open(encoding="utf-8") as f:
+            yaml_config = yaml.safe_load(f)
+
+        if yaml_config is None:
+            yaml_config = {}
+        if not isinstance(yaml_config, Mapping):
+            raise TypeError("--config-file YAML must contain a mapping at the top level")
+
+        source = self._get_yaml_registry_source(yaml_config)
+        if source is None:
+            raise ValueError(
+                "--config-file requires orch.torchtitan_config with module and config"
+            )
+
+        source_type = source.get("type", "registry")
+        if source_type not in {"registry", "torchtitan_registry"}:
+            raise ValueError(f"Unsupported torchtitan_config type: {source_type}")
+
+        module_name = source.get("module")
+        config_name = source.get("config")
+        if not module_name or not config_name:
+            raise ValueError("orch.torchtitan_config requires module and config")
+
+        loaded_config = self._load_registry_config(str(module_name), str(config_name))
+        metadata_keys = {
+            "orch",
+            "torchtitan_config",
+            "config_source",
+            "job",
+            "primus_turbo",
+        }
+        payload = {
+            key: value for key, value in yaml_config.items() if key not in metadata_keys
+        }
+        self._overlay_dataclass_config(loaded_config, payload)
+        return loaded_config
+
+    @staticmethod
+    def _get_yaml_registry_source(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        orch = config.get("orch", {})
+        if orch is None:
+            orch = {}
+        if not isinstance(orch, Mapping):
+            raise TypeError("orch must be a mapping")
+
+        source = orch.get("torchtitan_config") or orch.get("config_source")
+        if source is None:
+            source = config.get("torchtitan_config") or config.get("config_source")
+        if source is None:
+            return None
+        if not isinstance(source, Mapping):
+            raise TypeError("orch.torchtitan_config must be a mapping")
+        return source
+
+    @classmethod
+    def _overlay_dataclass_config(
+        cls, config: object, data: Mapping[str, Any], *, path: str = ""
+    ) -> None:
+        if not is_dataclass(config):
+            raise TypeError(
+                f"Cannot overlay YAML mapping onto non-dataclass config at {path or '<root>'}"
+            )
+
+        field_by_name = {item.name: item for item in fields(config)}
+        for raw_key, value in data.items():
+            key = str(raw_key).replace("-", "_")
+            field_path = f"{path}.{key}" if path else key
+            if key not in field_by_name:
+                raise ValueError(f"Unsupported YAML config field: {field_path}")
+
+            current_value = getattr(config, key)
+            if isinstance(value, Mapping) and is_dataclass(current_value):
+                cls._overlay_dataclass_config(current_value, value, path=field_path)
+            else:
+                setattr(config, key, value)
+
+    def _load_registry_config(self, module_name: str, config_name: str) -> object:
         from torchtitan.experiments import _supported_experiments
 
         # Validate module name
@@ -148,7 +258,7 @@ class ConfigManager:
             )
 
         loaded_config = config_fn()
-        return loaded_config, filtered_args
+        return loaded_config
 
     @staticmethod
     def _merge_configs(base, custom) -> type:

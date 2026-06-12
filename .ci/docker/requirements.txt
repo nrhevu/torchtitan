@@ -3,6 +3,7 @@ datasets >= 3.6.0, < 4.8.0
 tensorboard
 wandb
 fsspec
+PyYAML
 tyro >= 1.0.5
 tokenizers >= 0.15.0
 safetensors
