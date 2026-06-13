@@ -37,6 +37,7 @@ from torchtitan.config.configs import (
     CommConfig,
     CompileConfig,
     DebugConfig,
+    ModelSourceConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -70,6 +71,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         including model weights in .safetensors format, the model.safetensor.index.json file
         (fqn to file mapping), the config.json file, generation_config.json, and tokenizer files.
         """
+
+        model_source: ModelSourceConfig = field(default_factory=ModelSourceConfig)
+        """Optional non-registry source used to build ``model_spec``."""
 
         dump_folder: str = "./outputs"
         """Folder to dump job outputs"""

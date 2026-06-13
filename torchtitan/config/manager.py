@@ -6,7 +6,9 @@
 
 import importlib
 import os
+import subprocess
 import sys
+import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import field, fields, is_dataclass, make_dataclass
@@ -34,6 +36,7 @@ class ConfigManager:
     """
 
     def __init__(self):
+        self._config_file_base_dir: Path | None = None
         self.register_tyro_rules(custom_registry)
 
     def parse_args(self, args: list[str] = sys.argv[1:]):
@@ -44,6 +47,7 @@ class ConfigManager:
             config_cls, args=args, default=loaded_config, registry=custom_registry
         )
 
+        self._apply_model_source()
         self._validate_config()
 
         return self.config
@@ -53,6 +57,7 @@ class ConfigManager:
 
         Returns (loaded_config, filtered_args) with config source args stripped.
         """
+        self._config_file_base_dir = None
         module_name = None
         config_name = None
         config_file = None
@@ -130,22 +135,56 @@ class ConfigManager:
         if not isinstance(yaml_config, Mapping):
             raise TypeError("--config-file YAML must contain a mapping at the top level")
 
+        self._config_file_base_dir = config_path.parent.resolve()
         source = self._get_yaml_registry_source(yaml_config)
-        if source is None:
-            raise ValueError(
-                "--config-file requires orch.torchtitan_config with module and config"
-            )
+        model_source = self._get_yaml_model_source(yaml_config)
+        model_source_type = model_source.get("type") if model_source is not None else None
 
-        source_type = source.get("type", "registry")
-        if source_type not in {"registry", "torchtitan_registry"}:
-            raise ValueError(f"Unsupported torchtitan_config type: {source_type}")
+        if model_source_type == "hf_config":
+            if source is not None:
+                raise ValueError(
+                    "--config-file cannot combine model_source.type=hf_config "
+                    "with orch.torchtitan_config"
+                )
+            from torchtitan.components.loss import ChunkedCELoss
+            from torchtitan.experiments.ft.checkpoint import FTCheckpointManager
+            from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
+            from torchtitan.experiments.ft.trainer import FaultTolerantTrainer
+            from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+            from torchtitan.trainer import Trainer
 
-        module_name = source.get("module")
-        config_name = source.get("config")
-        if not module_name or not config_name:
-            raise ValueError("orch.torchtitan_config requires module and config")
+            if "fault_tolerance" in yaml_config:
+                loaded_config = FaultTolerantTrainer.Config(
+                    loss=ChunkedCELoss.Config(),
+                    dataloader=HuggingFaceTextDataLoader.Config(),
+                    optimizer=FTOptimizersContainer.Config(),
+                    checkpoint=FTCheckpointManager.Config(),
+                )
+            else:
+                loaded_config = Trainer.Config(
+                    loss=ChunkedCELoss.Config(),
+                    dataloader=HuggingFaceTextDataLoader.Config(),
+                )
+        else:
+            if model_source_type not in (None, ""):
+                raise ValueError(f"Unsupported model_source type: {model_source_type}")
+            if source is None:
+                raise ValueError(
+                    "--config-file requires model_source.type=hf_config or "
+                    "orch.torchtitan_config with module and config"
+                )
 
-        loaded_config = self._load_registry_config(str(module_name), str(config_name))
+            source_type = source.get("type", "registry")
+            if source_type not in {"registry", "torchtitan_registry"}:
+                raise ValueError(f"Unsupported torchtitan_config type: {source_type}")
+
+            module_name = source.get("module")
+            config_name = source.get("config")
+            if not module_name or not config_name:
+                raise ValueError("orch.torchtitan_config requires module and config")
+
+            loaded_config = self._load_registry_config(str(module_name), str(config_name))
+
         metadata_keys = {
             "orch",
             "torchtitan_config",
@@ -157,7 +196,17 @@ class ConfigManager:
             key: value for key, value in yaml_config.items() if key not in metadata_keys
         }
         self._overlay_dataclass_config(loaded_config, payload)
+        self._apply_hf_repo_assets_default(loaded_config, yaml_config)
         return loaded_config
+
+    @staticmethod
+    def _get_yaml_model_source(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        source = config.get("model_source")
+        if source is None:
+            return None
+        if not isinstance(source, Mapping):
+            raise TypeError("model_source must be a mapping")
+        return source
 
     @staticmethod
     def _get_yaml_registry_source(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -175,6 +224,23 @@ class ConfigManager:
         if not isinstance(source, Mapping):
             raise TypeError("orch.torchtitan_config must be a mapping")
         return source
+
+    @staticmethod
+    def _apply_hf_repo_assets_default(config: object, yaml_config: Mapping[str, Any]) -> None:
+        if "hf_assets_path" in yaml_config or "hf-assets-path" in yaml_config:
+            return
+
+        model_source = getattr(config, "model_source", None)
+        if getattr(model_source, "type", None) != "hf_config":
+            return
+
+        repo_id = getattr(model_source, "hf_repo", None)
+        if not repo_id:
+            return
+        model_name = str(repo_id).rstrip("/").split("/")[-1]
+        if not model_name:
+            raise ValueError(f"Invalid model_source.hf_repo value: {repo_id!r}")
+        setattr(config, "hf_assets_path", f"./assets/hf/{model_name}")
 
     @classmethod
     def _overlay_dataclass_config(
@@ -197,6 +263,152 @@ class ConfigManager:
                 cls._overlay_dataclass_config(current_value, value, path=field_path)
             else:
                 setattr(config, key, value)
+
+    def _apply_model_source(self) -> None:
+        model_source = getattr(self.config, "model_source", None)
+        if model_source is None:
+            return
+
+        source_type = getattr(model_source, "type", None)
+        if source_type in (None, ""):
+            return
+        if source_type != "hf_config":
+            raise ValueError(f"Unsupported model_source type: {source_type}")
+
+        from torchtitan.models.hf_config import build_model_spec
+
+        self._prepare_model_source_assets(model_source)
+        self.config.model_spec = build_model_spec(
+            model_source,
+            base_dir=self._config_file_base_dir,
+            hf_assets_path=getattr(self.config, "hf_assets_path", None),
+        )
+        self._apply_hf_initial_load_defaults(model_source)
+
+    def _prepare_model_source_assets(self, model_source: object) -> None:
+        repo_id = getattr(model_source, "hf_repo", None)
+        if not repo_id:
+            return
+
+        hf_assets_path = getattr(self.config, "hf_assets_path", None)
+        if not hf_assets_path:
+            return
+
+        download = getattr(model_source, "download", None)
+        enabled = True if download is None else bool(getattr(download, "enabled", True))
+        assets = self._model_source_asset_types(download)
+        local_dir = self._resolve_hf_assets_path(hf_assets_path)
+
+        if self._hf_assets_present(local_dir, assets):
+            return
+        if not enabled:
+            raise FileNotFoundError(
+                f"HF assets are missing at {local_dir}, and model_source.download.enabled is false"
+            )
+
+        if self._download_rank() == 0:
+            logger.info(
+                "Downloading missing HF assets for %s to %s: %s",
+                repo_id,
+                local_dir,
+                ",".join(assets),
+            )
+            self._download_hf_assets(str(repo_id), local_dir, assets)
+        else:
+            while not self._hf_assets_present(local_dir, assets):
+                time.sleep(5)
+
+    def _model_source_asset_types(self, download: object | None) -> list[str]:
+        initial_load = bool(getattr(download, "initial_load", False))
+        raw_assets = [] if download is None else list(getattr(download, "assets", []))
+        if raw_assets:
+            assets = [str(asset) for asset in raw_assets]
+        elif initial_load:
+            assets = ["config", "tokenizer", "safetensors"]
+        else:
+            assets = ["config", "tokenizer"]
+        if "config" not in assets:
+            assets.insert(0, "config")
+        return assets
+
+    @staticmethod
+    def _resolve_hf_assets_path(path: str) -> Path:
+        candidate = Path(path).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve()
+        return candidate.resolve()
+
+    @staticmethod
+    def _hf_assets_present(local_dir: Path, assets: list[str]) -> bool:
+        return all(ConfigManager._hf_asset_present(local_dir, asset) for asset in assets)
+
+    @staticmethod
+    def _hf_asset_present(local_dir: Path, asset: str) -> bool:
+        if asset == "config":
+            return (local_dir / "config.json").is_file()
+        if asset == "tokenizer":
+            tokenizer_files = (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "tokenizer.model",
+                "vocab.txt",
+                "vocab.json",
+                "merges.txt",
+                "special_tokens_map.json",
+            )
+            return any((local_dir / name).is_file() for name in tokenizer_files)
+        if asset == "safetensors":
+            return any(local_dir.glob("*.safetensors"))
+        if asset == "index":
+            return any(local_dir.glob("*model.safetensors.index.json"))
+        return False
+
+    @staticmethod
+    def _download_rank() -> int:
+        for key in ("RANK", "NODE_RANK"):
+            raw = os.getenv(key)
+            if raw is not None:
+                try:
+                    return int(raw)
+                except ValueError:
+                    return 0
+        return 0
+
+    @staticmethod
+    def _download_hf_assets(repo_id: str, local_dir: Path, assets: list[str]) -> None:
+        script_path = Path(__file__).resolve().parents[2] / "scripts" / "download_hf_assets.py"
+        if not script_path.is_file():
+            raise FileNotFoundError(f"TorchTitan HF asset downloader not found: {script_path}")
+
+        local_dir.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--repo_id",
+            repo_id,
+            "--assets",
+            *assets,
+            "--local_dir",
+            str(local_dir.parent),
+        ]
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_token:
+            cmd.extend(["--hf_token", hf_token])
+        ret = subprocess.run(cmd)
+        if ret.returncode != 0:
+            raise RuntimeError(f"TorchTitan HF asset download failed with exit code {ret.returncode}")
+
+    def _apply_hf_initial_load_defaults(self, model_source: object) -> None:
+        download = getattr(model_source, "download", None)
+        if not bool(getattr(download, "initial_load", False)):
+            return
+
+        checkpoint = getattr(self.config, "checkpoint", None)
+        if checkpoint is None:
+            return
+        checkpoint.enable = True
+        checkpoint.initial_load_in_hf = True
+        checkpoint.initial_load_model_only = True
 
     def _load_registry_config(self, module_name: str, config_name: str) -> object:
         from torchtitan.experiments import _supported_experiments

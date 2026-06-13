@@ -17,6 +17,8 @@ from .configs import (
     CommConfig,
     CompileConfig,
     DebugConfig,
+    ModelSourceConfig,
+    ModelSourceDownloadConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "TORCH_DTYPE_MAP",
     # Config dataclasses
     "ActivationCheckpointConfig",
+    "ModelSourceConfig",
+    "ModelSourceDownloadConfig",
     "CompileConfig",
     "ParallelismConfig",
     "CommConfig",

@@ -16,7 +16,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.loss import ChunkedCELoss, IGNORE_INDEX
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
@@ -242,6 +242,31 @@ class FaultTolerantTrainer(Trainer):
 
         # FT addition: set all reduce hook
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
+
+        # Set lm_head reference for ChunkedCELoss after model construction.
+        # Non-PP: single model part always has lm_head.
+        # PP: only the last stage has lm_head; non-last stages skip this.
+        if isinstance(self.loss_fn, ChunkedCELoss):
+            if parallel_dims.pp_enabled:
+                if self.pp_has_last_stage:
+                    lm_head = self.model_parts[-1].lm_head
+                    assert (
+                        lm_head is not None
+                    ), "Last PP stage must have lm_head for ChunkedCELoss"
+                    self.loss_fn.set_lm_head(
+                        lm_head  # pyrefly: ignore[bad-argument-type]
+                    )
+                    self.model_parts[
+                        -1
+                    ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
+            else:
+                assert len(self.model_parts) == 1
+                lm_head = self.model_parts[0].lm_head
+                assert lm_head is not None, "Model must have lm_head for ChunkedCELoss"
+                self.loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
+                self.model_parts[
+                    0
+                ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor

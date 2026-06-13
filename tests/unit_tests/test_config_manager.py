@@ -4,12 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.config import ConfigManager
+from torchtitan.experiments.ft.checkpoint import FTCheckpointManager
+from torchtitan.experiments.ft.optimizer import FTOptimizersContainer
+from torchtitan.experiments.ft.trainer import FaultTolerantTrainer
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
 
 
@@ -109,6 +117,155 @@ primus_turbo:
         assert config.training.local_batch_size == 2
         assert config.parallelism.data_parallel_shard_degree == 3
 
+    def test_config_file_loads_hf_config_model_source_without_orch(self):
+        """--config-file can build model_spec from HF config without orch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assets_dir = root / "assets" / "hf" / "Qwen3-0.6B"
+            assets_dir.mkdir(parents=True)
+            (assets_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3ForCausalLM"],
+                        "model_type": "qwen3",
+                        "hidden_size": 1024,
+                        "num_hidden_layers": 2,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 8,
+                        "head_dim": 128,
+                        "vocab_size": 151936,
+                        "rope_theta": 1000000.0,
+                        "max_position_embeddings": 4096,
+                        "tie_word_embeddings": True,
+                        "intermediate_size": 3072,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (assets_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                f"""\
+model_source:
+  type: hf_config
+  architecture: auto
+  hf_repo: Qwen/Qwen3-0.6B
+  download:
+    initial_load: true
+    assets: [tokenizer, config]
+hf_assets_path: {assets_dir}
+training:
+  steps: 7
+""",
+                encoding="utf-8",
+            )
+
+            config_manager = ConfigManager()
+            config = config_manager.parse_args(
+                ["--config-file", str(config_path), "--training.steps", "5"]
+            )
+
+        assert config.model_spec.name == "qwen3"
+        assert config.model_spec.flavor == "hf_config"
+        assert config.model_spec.model.dim == 1024
+        assert len(config.model_spec.model.layers) == 2
+        assert isinstance(config.dataloader, HuggingFaceTextDataLoader.Config)
+        assert isinstance(config.loss, ChunkedCELoss.Config)
+        assert config.training.steps == 5
+        assert config.hf_assets_path == str(assets_dir)
+        assert config.checkpoint.enable is True
+        assert config.checkpoint.initial_load_in_hf is True
+        assert config.checkpoint.initial_load_model_only is True
+        assert config.model_source.download.assets == ["tokenizer", "config"]
+
+    def test_config_file_loads_hf_config_fault_tolerant_trainer(self):
+        """hf_config YAML with fault_tolerance uses FT trainer components."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assets_dir = root / "assets" / "hf" / "Qwen3-0.6B"
+            assets_dir.mkdir(parents=True)
+            config_json = assets_dir / "config.json"
+            config_json.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3ForCausalLM"],
+                        "model_type": "qwen3",
+                        "hidden_size": 1024,
+                        "num_hidden_layers": 2,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 8,
+                        "head_dim": 128,
+                        "vocab_size": 151936,
+                        "rope_theta": 1000000.0,
+                        "max_position_embeddings": 4096,
+                        "tie_word_embeddings": True,
+                        "intermediate_size": 3072,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                f"""\
+model_source:
+  type: hf_config
+  architecture: auto
+  config_json: {config_json}
+  download:
+    enabled: false
+hf_assets_path: {assets_dir}
+fault_tolerance:
+  enable: true
+  replica_id: 1
+  group_size: 2
+  process_group: gloo
+checkpoint:
+  enable_ft_dataloader_checkpoints: false
+""",
+                encoding="utf-8",
+            )
+
+            config_manager = ConfigManager()
+            config = config_manager.parse_args(["--config-file", str(config_path)])
+
+        assert isinstance(config, FaultTolerantTrainer.Config)
+        assert isinstance(config.optimizer, FTOptimizersContainer.Config)
+        assert isinstance(config.checkpoint, FTCheckpointManager.Config)
+        assert config.fault_tolerance.enable is True
+        assert config.fault_tolerance.replica_id == 1
+        assert config.fault_tolerance.group_size == 2
+        assert config.checkpoint.enable_ft_dataloader_checkpoints is False
+        assert config.model_spec.name == "qwen3"
+        assert config.model_spec.flavor == "hf_config"
+
+    def test_hf_config_downloads_missing_assets(self):
+        """hf_config YAML downloads missing local assets when enabled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_manager = ConfigManager()
+            config_manager._config_file_base_dir = root
+            config_manager.config = Trainer.Config()
+            config_manager.config.hf_assets_path = str(
+                root / "assets" / "hf" / "Qwen3-0.6B"
+            )
+            config_manager.config.model_source.type = "hf_config"
+            config_manager.config.model_source.hf_repo = "Qwen/Qwen3-0.6B"
+            config_manager.config.model_source.download.assets = ["tokenizer", "config"]
+
+            def fake_download(cmd):
+                local_dir = Path(cmd[cmd.index("--local_dir") + 1]) / "Qwen3-0.6B"
+                local_dir.mkdir(parents=True)
+                (local_dir / "config.json").write_text("{}", encoding="utf-8")
+                (local_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0)
+
+            with patch("subprocess.run", side_effect=fake_download) as run:
+                config_manager._prepare_model_source_assets(
+                    config_manager.config.model_source
+                )
+
+        run.assert_called_once()
+
     def test_config_file_cli_overrides_yaml_values(self):
         """CLI args override values loaded from --config-file YAML."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -190,7 +347,10 @@ training:
             config_manager = ConfigManager()
             with pytest.raises(
                 ValueError,
-                match="--config-file requires orch.torchtitan_config with module and config",
+                match=(
+                    "--config-file requires model_source.type=hf_config "
+                    "or orch.torchtitan_config"
+                ),
             ):
                 config_manager.parse_args(["--config-file", str(config_path)])
 

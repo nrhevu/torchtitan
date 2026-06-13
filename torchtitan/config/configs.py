@@ -25,6 +25,42 @@ import torch
 
 
 @dataclass(kw_only=True, slots=True)
+class ModelSourceDownloadConfig:
+    enabled: bool = True
+    """Whether external orchestration should download missing HF assets."""
+
+    initial_load: bool = False
+    """Whether HF assets are expected to be used for initial checkpoint load."""
+
+    assets: list[str] = field(default_factory=list)
+    """HF asset groups requested by orchestration; TorchTitan does not download them."""
+
+
+@dataclass(kw_only=True, slots=True)
+class ModelSourceConfig:
+    type: Literal["hf_config"] | None = None
+    """Optional source used to build the model spec from non-registry metadata."""
+
+    architecture: str = "auto"
+    """HF architecture name to use, or ``auto`` to read it from config.json."""
+
+    config_json: str | None = None
+    """Path to a Hugging Face config.json file."""
+
+    hf_repo: str | None = None
+    """Hugging Face repository id used to infer local HF assets."""
+
+    attn_backend: str = "sdpa"
+    """Attention backend used for Qwen3 HF config model specs."""
+
+    moe_comm_backend: str = "standard"
+    """MoE communication backend used for Qwen3-MoE HF config model specs."""
+
+    download: ModelSourceDownloadConfig = field(default_factory=ModelSourceDownloadConfig)
+    """Optional HF asset download metadata accepted from Nexus-style YAMLs."""
+
+
+@dataclass(kw_only=True, slots=True)
 class TrainingConfig:
     local_batch_size: int = 8
     """Local batch size (i.e., per-device batch size)"""
