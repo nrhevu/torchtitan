@@ -11,7 +11,7 @@ from typing import Annotated, Any, cast
 
 import torch
 import tyro
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
@@ -33,6 +33,15 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _process_tokenized_input_ids(sample: dict[str, Any]) -> list[int]:
+    """Process a tokenized dataset sample saved with input_ids."""
+    input_ids = sample["input_ids"]
+    attention_mask = sample.get("attention_mask")
+    if attention_mask is None:
+        return list(input_ids)
+    return [token for token, keep in zip(input_ids, attention_mask) if keep]
+
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -49,6 +58,11 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    "tokenized_disk": DatasetConfig(
+        path="tokenized_data",
+        loader=load_from_disk,
+        sample_processor=_process_tokenized_input_ids,
     ),
 }
 
@@ -130,10 +144,13 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         while True:
             for sample in self._get_data_iter():
                 # Use the dataset-specific text processor
-                sample_text = self._text_processor(sample)
-                sample_tokens = self._tokenizer.encode(
-                    sample_text, add_bos=True, add_eos=True
-                )
+                sample_data = self._text_processor(sample)
+                if isinstance(sample_data, str):
+                    sample_tokens = self._tokenizer.encode(
+                        sample_data, add_bos=True, add_eos=True
+                    )
+                else:
+                    sample_tokens = list(sample_data)
 
                 self._inputs_buffer.extend(sample_tokens)
                 # Per-document positions reset at document boundaries,
